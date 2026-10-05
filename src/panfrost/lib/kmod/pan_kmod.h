@@ -96,6 +96,7 @@ struct pan_kmod_vm {
 
 /* Buffer object flags. */
 enum pan_kmod_bo_flags {
+   PAN_KMOD_BO_FLAG_SHARED_BACKING = BITFIELD_BIT(10),
    /* Allow GPU execution on this buffer. */
    PAN_KMOD_BO_FLAG_EXECUTABLE = BITFIELD_BIT(0),
 

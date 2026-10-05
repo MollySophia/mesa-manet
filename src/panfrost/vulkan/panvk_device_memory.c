@@ -17,6 +17,9 @@
 #include "util/u_atomic.h"
 #include "vk_debug_utils.h"
 #include "vk_log.h"
+#if defined(HAVE_PAN_KMOD_KBASE)
+#include "kmod/kbase_virtio.h"
+#endif
 
 static void
 panvk_memory_emit_report(struct panvk_device *device,
@@ -126,6 +129,11 @@ panvk_AllocateMemory(VkDevice _device,
          bo_flags |= PAN_KMOD_BO_FLAG_WB_MMAP;
 
       bo_flags = panvk_device_adjust_bo_flags(device, bo_flags);
+#if defined(HAVE_PAN_KMOD_KBASE)
+      if (kbv_has(device->kmod.dev->fd) &&
+          (type->propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
+         bo_flags |= PAN_KMOD_BO_FLAG_SHARED_BACKING;
+#endif
       mem->bo = pan_kmod_bo_alloc(device->kmod.dev,
                                   can_be_exported ? NULL : device->kmod.vm,
                                   pAllocateInfo->allocationSize, bo_flags);
@@ -435,6 +443,11 @@ panvk_InvalidateMappedMemoryRanges(VkDevice _device, uint32_t memoryRangeCount,
 
    if (result == VK_SUCCESS)
       pan_kmod_flush_bo_map_syncs(device->kmod.dev);
+
+#if defined(HAVE_PAN_KMOD_KBASE)
+   if (kbv_has_error(device->kmod.dev->fd))
+      return vk_device_set_lost(&device->vk, "virtio kbase memory synchronization failed");
+#endif
 
    return result;
 }

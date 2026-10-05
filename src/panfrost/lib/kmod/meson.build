@@ -14,7 +14,7 @@ if panfrost_kmds.contains('panthor')
 endif
 
 if panfrost_kmds.contains('kbase')
-  libpankmod_lib_files += files('kbase_kmod.c')
+  libpankmod_lib_files += files('kbase_kmod.c', 'mali_kbase_virtio.c')
 endif
 
 libpankmod_lib = static_library(

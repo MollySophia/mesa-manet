@@ -199,6 +199,11 @@ panvk_enumerate_physical_devices(struct vk_instance *vk_instance)
    for (int i = 0; i < PAN_KBASE_MAX_NODES; i++) {
       char path[PATH_MAX];
       snprintf(path, sizeof(path), "/dev/mali%d", i);
+      const char *virtio = getenv("PANVK_KBASE_VIRTIO");
+      if (virtio) {
+         if (i) break;
+         snprintf(path, sizeof(path), "%s", virtio);
+      }
 
       /* Missing optional nodes are normal and should not emit loader
        * warnings.  Existing nodes still go through full initialization so

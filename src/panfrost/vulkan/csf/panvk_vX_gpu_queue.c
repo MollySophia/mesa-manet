@@ -35,6 +35,7 @@
 #include <unistd.h>
 #include "drm-uapi/mali_kbase_ioctl.h"
 #include "kmod/kbase_kmod.h"
+#include "kmod/kbase_virtio.h"
 #endif
 
 #define MIN_DESC_TRACEBUF_SIZE (128 * 1024)
@@ -195,6 +196,7 @@ kbase_gpu_wmb(void)
 static inline void
 kbase_cache_clean_range(const void *start, size_t size)
 {
+   if (kbv_cpu_sync(start, size, BASE_SYNCSET_OP_MSYNC)) return;
 #if defined(__aarch64__)
    uintptr_t ptr = (uintptr_t)start & ~(uintptr_t)(KBASE_CACHELINE_SIZE - 1);
    uintptr_t end = ALIGN_POT((uintptr_t)start + size, KBASE_CACHELINE_SIZE);
@@ -212,6 +214,7 @@ kbase_cache_clean_range(const void *start, size_t size)
 static inline void
 kbase_cache_invalidate_range(const void *start, size_t size)
 {
+   if (kbv_cpu_sync(start, size, BASE_SYNCSET_OP_CSYNC)) return;
 #if defined(__aarch64__)
    uintptr_t ptr = (uintptr_t)start & ~(uintptr_t)(KBASE_CACHELINE_SIZE - 1);
    uintptr_t end = ALIGN_POT((uintptr_t)start + size, KBASE_CACHELINE_SIZE);

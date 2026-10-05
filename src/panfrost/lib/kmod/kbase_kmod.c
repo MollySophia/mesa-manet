@@ -57,9 +57,11 @@
 #include "drm-uapi/panthor_drm.h"
 
 #include "kbase_kmod.h"
+#include "mali_kbase_virtio.h"
 #include "pan_kmod_backend.h"
 #include "pan_props.h"
 #include "pan_trace.h"
+#define ioctl kbv_ioctl
 
 /* Forward declaration — the full definition is at the end of this file. */
 const struct pan_kmod_ops kbase_kmod_ops;
@@ -129,6 +131,7 @@ struct kbase_kmod_vm {
 
 struct kbase_kmod_bo {
    struct pan_kmod_bo base;
+   uint32_t virtio_handle, virtio_gem;
 
    /* GPU virtual address.  For SAME_VA allocations this equals the CPU
     * mapping address; for EXEC_VA-zone allocations it is the address
@@ -408,6 +411,7 @@ kbase_dev_query_props(struct kbase_kmod_dev *kbase_dev,
 static int
 kbase_query_csif_info(int fd, struct drm_panthor_csif_info *csif)
 {
+   if (kbv_has(fd)) return kbv_csif(fd, csif);
    /* First call with zero sizes to learn the group/stream counts. */
    union kbase_ioctl_cs_get_glb_iface req = { 0 };
    if (ioctl(fd, KBASE_IOCTL_CS_GET_GLB_IFACE, &req) < 0) {
@@ -740,6 +744,7 @@ kbase_kmod_csf_queue_bind(struct pan_kmod_dev *dev, uint32_t group_handle,
                           uint32_t ringbuf_size,
                           struct kbase_kmod_csf_user_io *io)
 {
+   if (kbv_has(dev->fd)) return kbv_queue_bind(dev->fd, group_handle, csi_index, ringbuf_va, ringbuf_size, io);
    struct kbase_ioctl_cs_queue_register reg = {
       .buffer_gpu_addr = ringbuf_va,
       .buffer_size = ringbuf_size,
@@ -802,6 +807,7 @@ void
 kbase_kmod_csf_queue_term(struct pan_kmod_dev *dev, uint64_t ringbuf_va,
                           struct kbase_kmod_csf_user_io *io)
 {
+   if (kbv_has(dev->fd)) { kbv_queue_term(dev->fd, ringbuf_va, io); return; }
    if (io->map)
       munmap(io->map, BASEP_QUEUE_NR_MMAP_USER_PAGES * 4096);
    *io = (struct kbase_kmod_csf_user_io){0};
@@ -818,6 +824,7 @@ kbase_kmod_csf_queue_term(struct pan_kmod_dev *dev, uint64_t ringbuf_va,
 int
 kbase_kmod_csf_queue_kick(struct pan_kmod_dev *dev, uint64_t ringbuf_va)
 {
+   if (kbv_has(dev->fd)) return kbv_queue_kick(dev->fd, ringbuf_va);
    struct kbase_ioctl_cs_queue_kick kick = {
       .buffer_gpu_addr = ringbuf_va,
    };
@@ -834,6 +841,7 @@ kbase_kmod_csf_queue_kick(struct pan_kmod_dev *dev, uint64_t ringbuf_va)
 int
 kbase_kmod_csf_wait_event(struct pan_kmod_dev *dev, int64_t timeout_ns)
 {
+   if (kbv_has(dev->fd)) return kbv_wait_event(dev->fd, timeout_ns);
    /* Block until the kernel has a CSF notification pending, then consume one
     * notification with read().  This is what drives kernel-side
     * servicing of the submitted work (tiler-heap OOM growth, sync-update
@@ -1145,6 +1153,7 @@ out:
 bool
 kbase_kmod_csf_has_error(const struct pan_kmod_dev *dev)
 {
+   if (kbv_has_error(dev->fd)) return true;
    const struct kbase_kmod_dev *kbase_dev =
       container_of(dev, const struct kbase_kmod_dev, base);
    return p_atomic_read(&kbase_dev->csf_error);
@@ -1199,6 +1208,7 @@ uint64_t
 kbase_kmod_alias_create(struct pan_kmod_dev *dev, uint64_t bo_va,
                         uint64_t size, uint32_t nents)
 {
+   if (kbv_has(dev->fd)) return kbv_alias_create(dev->fd, bo_va, size, nents);
    const uint64_t page_size = 4096;
    uint64_t total = size * nents;
    struct base_mem_aliasing_info ai[4];
@@ -1272,6 +1282,7 @@ void
 kbase_kmod_alias_destroy(struct pan_kmod_dev *dev, uint64_t va, uint64_t size,
                          uint32_t nents)
 {
+   if (kbv_has(dev->fd)) { kbv_alias_destroy(dev->fd, va); return; }
    /* SAME_VA region: munmap() tears down the GPU mapping too. */
    munmap((void *)(uintptr_t)va, size * nents);
 }
@@ -1290,8 +1301,10 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
     * legacy Midgard: 3.x). */
    struct kbase_ioctl_version_check ver = { 0 };
    bool is_csf = false;
+   int virtio = kbv_init(fd, &ver.major, &ver.minor);
+   if (virtio < 0) return NULL;
 
-   if (ioctl(fd, KBASE_IOCTL_VERSION_CHECK_CSF, &ver) == 0) {
+   if (virtio || ioctl(fd, KBASE_IOCTL_VERSION_CHECK_CSF, &ver) == 0) {
       is_csf = true;
    } else if (ioctl(fd, KBASE_IOCTL_VERSION_CHECK_JM, &ver) == 0) {
       is_csf = false;
@@ -1315,24 +1328,25 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
    /* Set context creation flags.  Zero for maximum compatibility; this also
     * creates the kernel-side context. */
    struct kbase_ioctl_set_flags set_flags = { .create_flags = 0 };
-   if (ioctl(fd, KBASE_IOCTL_SET_FLAGS, &set_flags)) {
+   if (!virtio && ioctl(fd, KBASE_IOCTL_SET_FLAGS, &set_flags)) {
       mesa_loge("kbase: KBASE_IOCTL_SET_FLAGS failed: %s", strerror(errno));
       return NULL;
    }
 
    /* Map the tracking page.  The kernel requires this before any memory
     * operation. */
-   void *tracking_page = mmap(NULL, 4096, PROT_NONE, MAP_SHARED, fd,
-                              BASE_MEM_MAP_TRACKING_HANDLE);
+   void *tracking_page = virtio ? mmap(NULL, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) :
+      mmap(NULL, 4096, PROT_NONE, MAP_SHARED, fd, BASE_MEM_MAP_TRACKING_HANDLE);
    if (tracking_page == MAP_FAILED) {
       mesa_loge("kbase: mmap(BASE_MEM_MAP_TRACKING_HANDLE) failed: %s",
                 strerror(errno));
+      kbv_finish(fd);
       return NULL;
    }
 
    /* Fetch GPU properties. */
    size_t props_size = 0;
-   uint8_t *props_buf = kbase_get_gpuprops(fd, &props_size);
+   uint8_t *props_buf = virtio ? kbv_props(fd, &props_size) : kbase_get_gpuprops(fd, &props_size);
    if (!props_buf) {
       mesa_loge("kbase: failed to read GPU properties");
       goto err_unmap_tracking;
@@ -1390,7 +1404,7 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
     * kernel path as a compatibility override; architectures without cache
     * ops fall back automatically. */
    const char *user_cache_sync = getenv("PANVK_KBASE_USER_CACHE_SYNC");
-   if (user_cache_sync && !strcmp(user_cache_sync, "0"))
+   if (virtio || (user_cache_sync && !strcmp(user_cache_sync, "0")))
       flags |= PAN_KMOD_DEV_FLAG_MMAP_SYNC_THROUGH_KERNEL;
 
    pan_kmod_dev_init(&kbase_dev->base, fd, flags, &kbase_drv,
@@ -1414,7 +1428,7 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
       return NULL;
    }
 
-   if (is_csf) {
+   if (is_csf && !virtio) {
       /* Map the CSF USER register page for LATEST_FLUSH reads.  Failure is
        * non-fatal: kbase_kmod_get_flush_id() then returns 0, which just
        * makes FLUSH_CACHE2 waits more conservative. */
@@ -1435,7 +1449,7 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
    if (!dma_heap || !dma_heap[0])
       dma_heap = "/dev/dma_heap/system";
 
-   kbase_dev->dma_heap_fd = open(dma_heap, O_RDONLY | O_CLOEXEC);
+   kbase_dev->dma_heap_fd = virtio ? -1 : open(dma_heap, O_RDONLY | O_CLOEXEC);
    if (kbase_dev->dma_heap_fd < 0)
       mesa_logd("kbase: dma-heap unavailable at %s: %s", dma_heap,
                 strerror(errno));
@@ -1460,7 +1474,7 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
     * notification poll, and exported semaphores/fences (dma-buf implicit
     * sync for WSI) become genuine dma-fences.  PANVK_KBASE_KCPU_SYNC=0
     * disables both queues. */
-   if (is_csf && !(kcpu_sync && !strcmp(kcpu_sync, "0"))) {
+   if (is_csf && !virtio && !(kcpu_sync && !strcmp(kcpu_sync, "0"))) {
       struct kbase_ioctl_kcpu_queue_new create = { 0 };
       if (!ioctl(fd, KBASE_IOCTL_KCPU_QUEUE_CREATE, &create)) {
          kbase_dev->kcpu.id = create.id;
@@ -1483,6 +1497,7 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
 
 err_unmap_tracking:
    munmap(tracking_page, 4096);
+   kbv_finish(fd);
    return NULL;
 }
 
@@ -1519,6 +1534,7 @@ kbase_kmod_dev_destroy(struct pan_kmod_dev *dev)
    if (kbase_dev->dma_heap_fd >= 0)
       close(kbase_dev->dma_heap_fd);
 
+   kbv_finish(dev->fd);
    pan_kmod_dev_cleanup(dev);
    pan_kmod_free(dev->allocator, kbase_dev);
 }
@@ -1742,6 +1758,23 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev,
 {
    struct kbase_kmod_dev *kbase_dev =
       container_of(dev, struct kbase_kmod_dev, base);
+   if (kbv_has(dev->fd)) {
+      size = (size + 4095) & ~4095ull;
+      kmod_flags |= PAN_KMOD_BO_FLAG_WB_MMAP;
+      kmod_flags &= ~PAN_KMOD_BO_FLAG_IO_COHERENT;
+      struct kbase_kmod_bo *bo = pan_kmod_dev_alloc(dev, sizeof(*bo));
+      if (!bo) return NULL;
+      bo->dmabuf_fd = -1;
+      if (kbv_bo_alloc(dev->fd, size, to_kbase_mem_flags(kmod_flags),
+                      !!(kmod_flags & PAN_KMOD_BO_FLAG_SHARED_BACKING), &bo->virtio_handle,
+                      &bo->virtio_gem, &bo->gpu_va, &bo->cpu_ptr)) {
+         mesa_loge("kbase virtio: BO size=%" PRIu64 " flags=0x%x failed: %s", size, kmod_flags, strerror(errno));
+         pan_kmod_dev_free(dev, bo); return NULL;
+      }
+      uint32_t handle = p_atomic_inc_return(&kbase_dev->next_handle);
+      pan_kmod_bo_init(&bo->base, dev, exclusive_vm, size, kmod_flags, handle);
+      return &bo->base;
+   }
 
    if (!exclusive_vm && kbase_dev->dma_heap_fd >= 0 &&
        !(kmod_flags & (PAN_KMOD_BO_FLAG_EXECUTABLE |
@@ -1869,6 +1902,11 @@ kbase_kmod_bo_free(struct pan_kmod_bo *bo)
       container_of(bo, struct kbase_kmod_bo, base);
 
    pan_kmod_bo_cleanup(bo);
+   if (kbase_bo->virtio_handle) {
+      kbv_bo_free(bo->dev->fd, kbase_bo->virtio_handle, kbase_bo->virtio_gem,
+                  kbase_bo->cpu_ptr, bo->size);
+      pan_kmod_dev_free(bo->dev, kbase_bo); return;
+   }
 
    /* For SAME_VA regions, munmap() alone tears the whole region down
     * (free-on-close); a MEM_FREE afterwards would hit a stale VA.  For
@@ -2007,6 +2045,11 @@ kbase_kmod_flush_bo_map_syncs(struct pan_kmod_dev *dev)
                     : BASE_SYNCSET_OP_CSYNC,
       };
 
+      if (kbase_bo->virtio_handle) {
+         if (kbv_bo_sync(dev->fd, kbase_bo->virtio_handle, sync->start, sync->size, req.type))
+            return -1;
+         continue;
+      }
       if (pan_kmod_ioctl(dev->fd, KBASE_IOCTL_MEM_SYNC, &req)) {
          mesa_loge("kbase: KBASE_IOCTL_MEM_SYNC failed: %s", strerror(errno));
          return -1;
